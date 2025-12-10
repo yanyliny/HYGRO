@@ -26,8 +26,9 @@ import h5py
 import numpy as np
 import pandas as pd
 from scipy import ndimage as ndi
+from scipy.ndimage import binary_fill_holes
 from skimage import morphology, measure, segmentation
-from skimage.morphology import disk, binary_closing, binary_dilation, binary_fill_holes
+from skimage.morphology import disk, binary_closing, binary_dilation
 from skimage.measure import label, regionprops, regionprops_table
 from skimage.segmentation import clear_border
 import matplotlib.pyplot as plt
