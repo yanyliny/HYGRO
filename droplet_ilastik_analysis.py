@@ -26,11 +26,13 @@ import h5py
 import numpy as np
 import pandas as pd
 from scipy import ndimage as ndi
-from scipy.ndimage import binary_fill_holes
+from scipy.ndimage import binary_fill_holes, distance_transform_edt
 from skimage import morphology, measure, segmentation
-from skimage.morphology import disk, binary_closing, binary_dilation
+from skimage.morphology import disk, binary_closing, binary_dilation, binary_erosion
+from skimage.morphology import reconstruction, remove_small_objects, remove_small_holes
 from skimage.measure import label, regionprops, regionprops_table
-from skimage.segmentation import clear_border
+from skimage.segmentation import clear_border, watershed
+from skimage.feature import peak_local_max
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from matplotlib.colors import ListedColormap
@@ -239,52 +241,308 @@ def extract_class_probability(prob_4d: np.ndarray, class_index: int) -> np.ndarr
     return class_prob
 
 
-def fix_halo_droplets(
-    binary_mask: np.ndarray,
-    closing_radius: int = 3,
-    dilation_iterations: int = 1,
-    fill_holes: bool = True
+def find_droplet_centers_from_halos(
+    prob_frame: np.ndarray,
+    edge_threshold: float = 0.5,
+    center_threshold: float = 0.3,
+    min_center_distance: int = 10
 ) -> np.ndarray:
     """
-    Fix halo-shaped droplets by closing, dilating, and filling holes.
+    Find droplet centers by detecting the low-probability regions inside high-probability rings.
 
-    This addresses the common issue where ilastik captures droplet edges
-    but the interior has low probability, creating ring-like structures.
+    Halo pattern: droplets have bright edges (high prob) and dark centers (low prob).
+    We find centers by looking for local minima in probability that are surrounded by edges.
+
+    Parameters
+    ----------
+    prob_frame : np.ndarray
+        2D probability map (Y, X).
+    edge_threshold : float
+        Threshold above which pixels are considered droplet edges.
+    center_threshold : float
+        Threshold below which pixels could be droplet centers.
+    min_center_distance : int
+        Minimum distance between detected centers.
+
+    Returns
+    -------
+    markers : np.ndarray
+        Labeled marker image where each droplet center has a unique label.
+    """
+    # Get the edge mask (high probability ring regions)
+    edges = prob_frame > edge_threshold
+
+    # Get potential center regions (low probability inside droplets)
+    # These are pixels with low probability
+    potential_centers = prob_frame < center_threshold
+
+    # Find regions that are enclosed by edges (holes in the edge mask)
+    # Use binary_fill_holes to find what's inside closed rings
+    filled_edges = binary_fill_holes(edges)
+
+    # The interior of droplets = filled - edges
+    interior = filled_edges & ~edges
+
+    # Centers must be in low-probability regions AND inside filled edge regions
+    center_candidates = potential_centers & interior
+
+    # Clean up small noise
+    center_candidates = remove_small_objects(center_candidates, min_size=5)
+
+    # Use distance transform to find the center of each candidate region
+    if np.any(center_candidates):
+        distance = distance_transform_edt(center_candidates)
+
+        # Find local maxima of distance transform as droplet centers
+        coords = peak_local_max(
+            distance,
+            min_distance=min_center_distance,
+            labels=label(center_candidates),
+            exclude_border=False
+        )
+
+        # Create marker image
+        markers = np.zeros(prob_frame.shape, dtype=np.int32)
+        for i, (y, x) in enumerate(coords, start=1):
+            markers[y, x] = i
+    else:
+        markers = np.zeros(prob_frame.shape, dtype=np.int32)
+
+    return markers
+
+
+def fill_holes_per_component(binary_mask: np.ndarray) -> np.ndarray:
+    """
+    Fill holes in each connected component individually.
+
+    Unlike binary_fill_holes which fills globally, this fills holes
+    within each connected component separately, preventing adjacent
+    components from merging.
 
     Parameters
     ----------
     binary_mask : np.ndarray
-        Binary mask of shape (Y, X) from thresholding.
-    closing_radius : int
-        Radius of disk structuring element for morphological closing.
-    dilation_iterations : int
-        Number of binary dilation iterations to help close gaps.
-    fill_holes : bool
-        Whether to fill holes in the binary mask.
+        Binary mask with potential holes.
 
     Returns
     -------
-    fixed_mask : np.ndarray
-        Binary mask with halos fixed.
+    filled : np.ndarray
+        Binary mask with holes filled per-component.
     """
-    mask = binary_mask.copy()
+    # Label connected components
+    labeled = label(binary_mask, connectivity=2)
+    n_components = labeled.max()
 
-    # Step 1: Dilate slightly to connect nearby edges
-    if dilation_iterations > 0:
-        mask = binary_dilation(mask, footprint=disk(1), out=mask)
-        for _ in range(dilation_iterations - 1):
-            mask = binary_dilation(mask, footprint=disk(1))
+    if n_components == 0:
+        return binary_mask.copy()
 
-    # Step 2: Morphological closing to bridge gaps in rings
-    if closing_radius > 0:
-        selem = disk(closing_radius)
-        mask = binary_closing(mask, footprint=selem)
+    filled = np.zeros_like(binary_mask)
 
-    # Step 3: Fill holes to complete the droplet interiors
-    if fill_holes:
-        mask = binary_fill_holes(mask)
+    for comp_id in range(1, n_components + 1):
+        # Extract this component
+        component = (labeled == comp_id)
 
-    return mask.astype(np.uint8)
+        # Get bounding box for efficiency
+        rows = np.any(component, axis=1)
+        cols = np.any(component, axis=0)
+        rmin, rmax = np.where(rows)[0][[0, -1]]
+        cmin, cmax = np.where(cols)[0][[0, -1]]
+
+        # Add padding for fill_holes to work correctly
+        pad = 2
+        rmin_p = max(0, rmin - pad)
+        rmax_p = min(binary_mask.shape[0], rmax + pad + 1)
+        cmin_p = max(0, cmin - pad)
+        cmax_p = min(binary_mask.shape[1], cmax + pad + 1)
+
+        # Extract region and fill holes
+        region = component[rmin_p:rmax_p, cmin_p:cmax_p]
+        region_filled = binary_fill_holes(region)
+
+        # Put back
+        filled[rmin_p:rmax_p, cmin_p:cmax_p] |= region_filled
+
+    return filled.astype(np.uint8)
+
+
+def segment_halo_droplets_watershed(
+    prob_frame: np.ndarray,
+    edge_threshold: float = 0.5,
+    center_threshold: float = 0.3,
+    min_center_distance: int = 10,
+    closing_radius: int = 2
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Segment halo-shaped droplets using watershed from detected centers.
+
+    This handles the case where ilastik produces ring/halo patterns with
+    bright edges and dark centers. Uses watershed to separate touching droplets.
+
+    Strategy:
+    1. Find droplet centers using distance transform on low-probability regions
+    2. Use watershed from centers, constrained by the probability map
+    3. This separates touching droplets even if their edges connect
+
+    Parameters
+    ----------
+    prob_frame : np.ndarray
+        2D probability map (Y, X).
+    edge_threshold : float
+        Threshold for detecting droplet edges.
+    center_threshold : float
+        Threshold for detecting droplet centers.
+    min_center_distance : int
+        Minimum distance between droplet centers.
+    closing_radius : int
+        Radius for closing gaps in edges.
+
+    Returns
+    -------
+    binary_mask : np.ndarray
+        Binary mask of all droplets.
+    labeled_mask : np.ndarray
+        Labeled mask where each droplet has unique integer.
+    """
+    # Step 1: Get edge regions (high probability = droplet edges in halo pattern)
+    edges = prob_frame > edge_threshold
+
+    # Step 2: Find droplet centers using distance transform from edges
+    # In halo pattern, center is far from the bright edges
+    # Use inverted probability: low prob regions are "high" in inverted
+    inverted_prob = 1.0 - prob_frame
+
+    # Distance from edge pixels - centers are far from edges
+    distance_from_edges = distance_transform_edt(~edges)
+
+    # Weight by inverted probability (prefer low-prob centers)
+    center_score = distance_from_edges * (inverted_prob > (1 - center_threshold))
+
+    # Find local maxima as droplet centers
+    if np.any(center_score > 0):
+        coords = peak_local_max(
+            center_score,
+            min_distance=min_center_distance,
+            threshold_abs=1.0,  # Must be at least 1 pixel from edge
+            exclude_border=False
+        )
+
+        # Create marker image
+        markers = np.zeros(prob_frame.shape, dtype=np.int32)
+        for i, (y, x) in enumerate(coords, start=1):
+            markers[y, x] = i
+        n_markers = len(coords)
+    else:
+        markers = np.zeros(prob_frame.shape, dtype=np.int32)
+        n_markers = 0
+
+    if n_markers == 0:
+        # Fall back to simple edge-based segmentation
+        if closing_radius > 0:
+            edges = binary_closing(edges, footprint=disk(closing_radius))
+        filled = fill_holes_per_component(edges)
+        labeled = label(filled, connectivity=2)
+        binary_mask = filled.astype(np.uint8)
+        return binary_mask, labeled
+
+    # Step 3: Create mask - use probability threshold directly
+    # Any pixel with prob > low_threshold could be part of a droplet
+    low_threshold = edge_threshold * 0.3  # Be generous
+    droplet_mask = prob_frame > low_threshold
+
+    # Step 4: Use watershed to separate touching droplets
+    # Elevation = probability (high prob = ridges/barriers between droplets)
+    # Watershed grows from centers (low prob) and stops at edges (high prob)
+    elevation = prob_frame.copy()
+
+    # Dilate markers slightly
+    markers_dilated = binary_dilation(markers > 0, footprint=disk(3))
+    markers_labeled = label(markers_dilated)
+
+    # Re-assign original marker labels
+    final_markers = np.zeros_like(markers)
+    for i in range(1, n_markers + 1):
+        orig_coords = np.where(markers == i)
+        if len(orig_coords[0]) > 0:
+            y, x = orig_coords[0][0], orig_coords[1][0]
+            region_label = markers_labeled[y, x]
+            if region_label > 0:
+                final_markers[markers_labeled == region_label] = i
+
+    # Watershed - will naturally stop at high probability boundaries
+    labeled = watershed(elevation, final_markers, mask=droplet_mask)
+
+    binary_mask = (labeled > 0).astype(np.uint8)
+
+    return binary_mask, labeled
+
+
+def segment_droplets_inverted(
+    prob_frame: np.ndarray,
+    prob_threshold: float = 0.5,
+    min_droplet_size: int = 50,
+    max_hole_size: int = 500,
+    separation_threshold: float = 0.7
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Alternative segmentation: treat LOW probability as droplet interiors.
+
+    For halo patterns where the CENTER of droplets has low probability,
+    we can invert the logic: threshold to find dark centers, then expand.
+
+    Parameters
+    ----------
+    prob_frame : np.ndarray
+        2D probability map (Y, X).
+    prob_threshold : float
+        Pixels BELOW this are considered droplet interiors.
+    min_droplet_size : int
+        Minimum droplet area.
+    max_hole_size : int
+        Maximum hole size to fill in droplets.
+    separation_threshold : float
+        Higher threshold to find definite edges for separation.
+
+    Returns
+    -------
+    binary_mask : np.ndarray
+        Binary mask of droplets.
+    labeled_mask : np.ndarray
+        Labeled droplets.
+    """
+    # Find definite droplet regions (low probability = inside droplet)
+    droplet_interior = prob_frame < prob_threshold
+
+    # Find high-confidence edges to use as barriers
+    definite_edges = prob_frame > separation_threshold
+
+    # Remove the edges from interior estimate
+    droplet_interior = droplet_interior & ~definite_edges
+
+    # Clean up
+    droplet_interior = remove_small_objects(droplet_interior, min_size=min_droplet_size // 2)
+
+    # Label connected components
+    labeled = label(droplet_interior, connectivity=2)
+
+    # For each component, dilate slightly to capture the edge region
+    # but use watershed to prevent merging
+
+    # Distance transform for watershed
+    distance = distance_transform_edt(droplet_interior)
+
+    # Use the labeled regions as markers
+    markers = labeled.copy()
+
+    # Define the basin - everywhere that's not a definite edge
+    basin = ~definite_edges
+
+    # Watershed to expand droplets up to edges
+    expanded = watershed(-distance, markers, mask=basin)
+
+    # Fill small holes in each droplet
+    binary_mask = (expanded > 0).astype(np.uint8)
+
+    return binary_mask, expanded
 
 
 def process_single_frame(
@@ -293,25 +551,33 @@ def process_single_frame(
     min_area: int,
     max_area: int,
     closing_radius: int,
-    dilation_iterations: int
+    min_center_distance: int = 10,
+    center_threshold: float = 0.3,
+    use_watershed: bool = True
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Process a single probability frame to get labeled droplets.
+
+    Uses watershed-based segmentation to properly separate halo-shaped droplets.
 
     Parameters
     ----------
     prob_frame : np.ndarray
         2D probability map (Y, X).
     prob_threshold : float
-        Threshold for binarization.
+        Threshold for detecting droplet edges.
     min_area : int
         Minimum droplet area to keep.
     max_area : int
         Maximum droplet area (0 = no limit).
     closing_radius : int
         Radius for morphological closing.
-    dilation_iterations : int
-        Number of dilation iterations.
+    min_center_distance : int
+        Minimum distance between droplet centers for watershed.
+    center_threshold : float
+        Probability threshold below which pixels are considered droplet centers.
+    use_watershed : bool
+        If True, use watershed segmentation. If False, use simple thresholding.
 
     Returns
     -------
@@ -320,19 +586,22 @@ def process_single_frame(
     labeled_mask : np.ndarray
         Labeled regions (each droplet has unique integer label).
     """
-    # Threshold
-    binary = prob_frame > prob_threshold
-
-    # Fix halos
-    binary = fix_halo_droplets(
-        binary,
-        closing_radius=closing_radius,
-        dilation_iterations=dilation_iterations,
-        fill_holes=True
-    )
-
-    # Label connected components
-    labeled = label(binary, connectivity=2)
+    if use_watershed:
+        # Use watershed-based segmentation for halo droplets
+        binary, labeled = segment_halo_droplets_watershed(
+            prob_frame,
+            edge_threshold=prob_threshold,
+            center_threshold=center_threshold,
+            min_center_distance=min_center_distance,
+            closing_radius=closing_radius
+        )
+    else:
+        # Simple thresholding fallback
+        binary = prob_frame > prob_threshold
+        binary = binary_closing(binary, footprint=disk(closing_radius))
+        binary = binary_fill_holes(binary)
+        labeled = label(binary, connectivity=2)
+        binary = binary.astype(np.uint8)
 
     # Filter by area
     regions = regionprops(labeled)
@@ -633,17 +902,21 @@ def run_analysis(args: argparse.Namespace) -> None:
     png_dir = output_dir / 'pngs'
     png_dir.mkdir(exist_ok=True)
 
+    use_watershed = not args.no_watershed
+
     print("=" * 60)
     print("DROPLET CONDENSATION ANALYSIS")
     print("=" * 60)
     print(f"H5 file: {args.h5}")
     print(f"Output directory: {output_dir}")
     print(f"Class index: {args.class_index}")
-    print(f"Probability threshold: {args.prob_threshold}")
+    print(f"Segmentation: {'watershed' if use_watershed else 'simple threshold'}")
+    print(f"Edge threshold: {args.prob_threshold}")
+    print(f"Center threshold: {args.center_threshold}")
+    print(f"Min center distance: {args.min_center_distance} px")
     print(f"Min area: {args.min_area} px")
     print(f"Max area: {args.max_area} px" if args.max_area > 0 else "Max area: unlimited")
     print(f"Closing radius: {args.closing_radius}")
-    print(f"Dilation iterations: {args.dilation_iterations}")
     print("=" * 60)
 
     # Load HDF5 probability data
@@ -693,7 +966,9 @@ def run_analysis(args: argparse.Namespace) -> None:
             min_area=args.min_area,
             max_area=args.max_area,
             closing_radius=args.closing_radius,
-            dilation_iterations=args.dilation_iterations
+            min_center_distance=args.min_center_distance,
+            center_threshold=args.center_threshold,
+            use_watershed=use_watershed
         )
 
         # Compute statistics
@@ -770,22 +1045,25 @@ def parse_arguments() -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Basic usage with required arguments
-  python droplet_ilastik_analysis.py --h5 probs.h5 --class-index 1
+  # Basic usage with required arguments (uses watershed segmentation by default)
+  python droplet_ilastik_analysis.py --h5 probs.h5 --class-index 0
+
+  # Tune for halo-shaped droplets (adjust center detection)
+  python droplet_ilastik_analysis.py --h5 probs.h5 --class-index 0 \\
+      --prob-threshold 0.6 --center-threshold 0.3 --min-center-distance 15
 
   # With raw images for overlay visualization
-  python droplet_ilastik_analysis.py --h5 probs.h5 --class-index 1 --raw images.tif
-
-  # Adjust morphological parameters for large halos
-  python droplet_ilastik_analysis.py --h5 probs.h5 --class-index 1 \\
-      --closing-radius 5 --dilation-iterations 2
+  python droplet_ilastik_analysis.py --h5 probs.h5 --class-index 0 --raw images.tif
 
   # Filter droplet sizes
-  python droplet_ilastik_analysis.py --h5 probs.h5 --class-index 1 \\
+  python droplet_ilastik_analysis.py --h5 probs.h5 --class-index 0 \\
       --min-area 50 --max-area 10000
 
+  # Disable watershed (simple thresholding)
+  python droplet_ilastik_analysis.py --h5 probs.h5 --class-index 0 --no-watershed
+
   # Save every 5th frame only
-  python droplet_ilastik_analysis.py --h5 probs.h5 --class-index 1 --png-stride 5
+  python droplet_ilastik_analysis.py --h5 probs.h5 --class-index 0 --png-stride 5
         """
     )
 
@@ -814,7 +1092,21 @@ Examples:
         '--prob-threshold',
         type=float,
         default=0.5,
-        help='Probability threshold for binarization (default: 0.5).'
+        help='Probability threshold for detecting droplet edges (default: 0.5).'
+    )
+    parser.add_argument(
+        '--center-threshold',
+        type=float,
+        default=0.3,
+        help='Probability threshold below which pixels are droplet centers (default: 0.3). '
+             'For halo patterns, centers have LOW probability.'
+    )
+    parser.add_argument(
+        '--min-center-distance',
+        type=int,
+        default=10,
+        help='Minimum distance between droplet centers in pixels (default: 10). '
+             'Increase for larger/sparser droplets.'
     )
     parser.add_argument(
         '--min-area',
@@ -831,14 +1123,9 @@ Examples:
     parser.add_argument(
         '--closing-radius',
         type=int,
-        default=3,
-        help='Disk radius for morphological closing (default: 3).'
-    )
-    parser.add_argument(
-        '--dilation-iterations',
-        type=int,
-        default=1,
-        help='Number of dilation iterations (default: 1).'
+        default=2,
+        help='Disk radius for morphological closing (default: 2). '
+             'Smaller values prevent merging adjacent droplets.'
     )
     parser.add_argument(
         '--output-dir',
@@ -856,6 +1143,11 @@ Examples:
         '--no-overlays',
         action='store_true',
         help='Skip overlay images, save masks only.'
+    )
+    parser.add_argument(
+        '--no-watershed',
+        action='store_true',
+        help='Disable watershed segmentation, use simple thresholding instead.'
     )
 
     return parser.parse_args()
@@ -886,8 +1178,12 @@ def main():
         print(f"[ERROR] closing_radius must be >= 0, got {args.closing_radius}")
         sys.exit(1)
 
-    if args.dilation_iterations < 0:
-        print(f"[ERROR] dilation_iterations must be >= 0, got {args.dilation_iterations}")
+    if args.center_threshold < 0 or args.center_threshold > 1:
+        print(f"[ERROR] center_threshold must be between 0 and 1, got {args.center_threshold}")
+        sys.exit(1)
+
+    if args.min_center_distance < 1:
+        print(f"[ERROR] min_center_distance must be >= 1, got {args.min_center_distance}")
         sys.exit(1)
 
     if args.png_stride < 1:
