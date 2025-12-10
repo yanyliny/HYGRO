@@ -1,0 +1,2 @@
+frame,n_droplets,total_droplet_area_px,coverage_fraction,coverage_percent,mean_area_px,median_area_px,std_area_px,min_droplet_area_px,max_droplet_area_px
+0,1063,7170696.0,0.6942923668947055,69.42923668947056,6745.715898400753,49.0,207724.02960847112,20.0,6775343.0
