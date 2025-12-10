@@ -373,15 +373,16 @@ def segment_halo_droplets_watershed(
     closing_radius: int = 2
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Segment halo-shaped droplets using watershed from detected centers.
+    Segment halo-shaped droplets by finding ring patterns.
 
-    This handles the case where ilastik produces ring/halo patterns with
-    bright edges and dark centers. Uses watershed to separate touching droplets.
+    In halo pattern: droplets appear as RINGS with high probability edges
+    and low probability centers. Each ring = one droplet.
 
     Strategy:
-    1. Find droplet centers using distance transform on low-probability regions
-    2. Use watershed from centers, constrained by the probability map
-    3. This separates touching droplets even if their edges connect
+    1. Threshold to get edge mask (high prob regions)
+    2. Fill holes in edge mask - each filled hole is a droplet interior
+    3. The filled regions (interior + edge) are individual droplets
+    4. Use labeling on the filled mask to get individual droplets
 
     Parameters
     ----------
@@ -390,9 +391,9 @@ def segment_halo_droplets_watershed(
     edge_threshold : float
         Threshold for detecting droplet edges.
     center_threshold : float
-        Threshold for detecting droplet centers.
+        Not used in this version but kept for API compatibility.
     min_center_distance : int
-        Minimum distance between droplet centers.
+        Not used in this version but kept for API compatibility.
     closing_radius : int
         Radius for closing gaps in edges.
 
@@ -403,75 +404,56 @@ def segment_halo_droplets_watershed(
     labeled_mask : np.ndarray
         Labeled mask where each droplet has unique integer.
     """
-    # Step 1: Get edge regions (high probability = droplet edges in halo pattern)
+    # Step 1: Get edge mask (high probability = droplet edges in halo pattern)
     edges = prob_frame > edge_threshold
 
-    # Step 2: Find droplet centers using distance transform from edges
-    # In halo pattern, center is far from the bright edges
-    # Use inverted probability: low prob regions are "high" in inverted
-    inverted_prob = 1.0 - prob_frame
+    # Step 2: Close small gaps in the ring edges
+    if closing_radius > 0:
+        edges = binary_closing(edges, footprint=disk(closing_radius))
 
-    # Distance from edge pixels - centers are far from edges
-    distance_from_edges = distance_transform_edt(~edges)
+    # Step 3: Find droplet interiors by inverting and labeling
+    # The "holes" in the edge mask are droplet centers + background
+    # We need to identify which holes are droplet interiors vs background
 
-    # Weight by inverted probability (prefer low-prob centers)
-    center_score = distance_from_edges * (inverted_prob > (1 - center_threshold))
+    # Invert: now droplet centers and background are foreground
+    inverted = ~edges
 
-    # Find local maxima as droplet centers
-    if np.any(center_score > 0):
-        coords = peak_local_max(
-            center_score,
-            min_distance=min_center_distance,
-            threshold_abs=1.0,  # Must be at least 1 pixel from edge
-            exclude_border=False
-        )
+    # Label connected components of the inverted mask
+    labeled_holes = label(inverted, connectivity=2)
 
-        # Create marker image
-        markers = np.zeros(prob_frame.shape, dtype=np.int32)
-        for i, (y, x) in enumerate(coords, start=1):
-            markers[y, x] = i
-        n_markers = len(coords)
-    else:
-        markers = np.zeros(prob_frame.shape, dtype=np.int32)
-        n_markers = 0
+    # For each hole, check if it's surrounded by edges (= droplet interior)
+    # or touches the image border (= background)
+    regions = regionprops(labeled_holes)
 
-    if n_markers == 0:
-        # Fall back to simple edge-based segmentation
-        if closing_radius > 0:
-            edges = binary_closing(edges, footprint=disk(closing_radius))
-        filled = fill_holes_per_component(edges)
-        labeled = label(filled, connectivity=2)
-        binary_mask = filled.astype(np.uint8)
-        return binary_mask, labeled
+    droplet_interiors = np.zeros_like(edges, dtype=bool)
 
-    # Step 3: Create mask - use probability threshold directly
-    # Any pixel with prob > low_threshold could be part of a droplet
-    low_threshold = edge_threshold * 0.3  # Be generous
-    droplet_mask = prob_frame > low_threshold
+    for region in regions:
+        # Get the region mask
+        minr, minc, maxr, maxc = region.bbox
 
-    # Step 4: Use watershed to separate touching droplets
-    # Elevation = probability (high prob = ridges/barriers between droplets)
-    # Watershed grows from centers (low prob) and stops at edges (high prob)
-    elevation = prob_frame.copy()
+        # Check if region touches image border - likely background
+        touches_border = (minr == 0 or minc == 0 or
+                         maxr == prob_frame.shape[0] or
+                         maxc == prob_frame.shape[1])
 
-    # Dilate markers slightly
-    markers_dilated = binary_dilation(markers > 0, footprint=disk(3))
-    markers_labeled = label(markers_dilated)
+        if touches_border:
+            # This is likely background, not a droplet interior
+            # But small regions touching border might still be droplets
+            if region.area > 10000:  # Large region touching border = background
+                continue
 
-    # Re-assign original marker labels
-    final_markers = np.zeros_like(markers)
-    for i in range(1, n_markers + 1):
-        orig_coords = np.where(markers == i)
-        if len(orig_coords[0]) > 0:
-            y, x = orig_coords[0][0], orig_coords[1][0]
-            region_label = markers_labeled[y, x]
-            if region_label > 0:
-                final_markers[markers_labeled == region_label] = i
+        # This hole is surrounded by edges = droplet interior
+        droplet_interiors[labeled_holes == region.label] = True
 
-    # Watershed - will naturally stop at high probability boundaries
-    labeled = watershed(elevation, final_markers, mask=droplet_mask)
+    # Step 4: Fill holes PER COMPONENT to get individual droplets
+    # At high threshold (0.8), edge rings should be separate components
+    # Filling holes in each ring component gives filled droplets
+    droplet_mask = fill_holes_per_component(edges)
 
-    binary_mask = (labeled > 0).astype(np.uint8)
+    # Step 5: Label individual droplets
+    labeled = label(droplet_mask, connectivity=2)
+
+    binary_mask = droplet_mask.astype(np.uint8)
 
     return binary_mask, labeled
 
@@ -741,7 +723,7 @@ def create_overlay_image(
     frame_stats: Dict[str, Any]
 ) -> plt.Figure:
     """
-    Create a figure with overlay visualization for QC.
+    Create a clean figure with circles drawn around detected droplets.
 
     Parameters
     ----------
@@ -763,62 +745,71 @@ def create_overlay_image(
     fig : plt.Figure
         Matplotlib figure with the overlay.
     """
-    n_cols = 3 if raw_frame is not None else 2
-    fig, axes = plt.subplots(1, n_cols, figsize=(5 * n_cols, 5))
+    from matplotlib.patches import Circle, Ellipse
 
-    col_idx = 0
+    # Get droplet properties for drawing circles
+    regions = regionprops(labeled_mask)
 
-    # Raw image with overlay (if available)
-    if raw_frame is not None:
-        ax = axes[col_idx]
-        col_idx += 1
+    fig, axes = plt.subplots(1, 2, figsize=(14, 7))
 
-        # Normalize raw frame for display
-        if raw_frame.ndim == 2:
-            display_raw = raw_frame
-            ax.imshow(display_raw, cmap='gray')
-        else:
-            display_raw = raw_frame
-            ax.imshow(display_raw)
+    # Panel 1: Probability map with circle overlays
+    ax = axes[0]
+    ax.imshow(prob_frame, cmap='gray', vmin=0, vmax=1)
 
-        # Overlay mask contours
-        ax.contour(binary_mask, colors='cyan', linewidths=0.8, levels=[0.5])
-        ax.set_title(f'Frame {frame_index}: Raw + Contours')
-        ax.axis('off')
+    # Draw circles around each detected droplet
+    for region in regions:
+        # Get centroid and equivalent diameter
+        cy, cx = region.centroid
+        # Use equivalent diameter (diameter of circle with same area)
+        radius = region.equivalent_diameter_area / 2
 
-    # Probability map
-    ax = axes[col_idx]
-    col_idx += 1
-    im = ax.imshow(prob_frame, cmap='viridis', vmin=0, vmax=1)
-    ax.contour(binary_mask, colors='red', linewidths=0.5, levels=[0.5])
-    ax.set_title(f'Probability Map')
+        # Draw circle
+        circle = Circle((cx, cy), radius, fill=False, edgecolor='cyan',
+                        linewidth=1.5, linestyle='-')
+        ax.add_patch(circle)
+
+    ax.set_title(f'Frame {frame_index}: Probability Map with Detected Droplets (n={len(regions)})')
     ax.axis('off')
-    plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
-    # Labeled mask with colormap
-    ax = axes[col_idx]
-    n_labels = labeled_mask.max()
-    if n_labels > 0:
-        # Create random colormap for labels
-        np.random.seed(42)  # Reproducible colors
-        colors = np.random.rand(n_labels + 1, 3)
-        colors[0] = [0, 0, 0]  # Background is black
-        cmap = ListedColormap(colors)
-        ax.imshow(labeled_mask, cmap=cmap, interpolation='nearest')
-    else:
-        ax.imshow(labeled_mask, cmap='gray')
+    # Panel 2: Same but on grayscale version for clarity
+    ax = axes[1]
+    # Convert prob to grayscale display
+    ax.imshow(prob_frame, cmap='gray', vmin=0, vmax=1)
 
-    ax.set_title(f'Labeled Droplets (n={frame_stats["n_droplets"]})')
+    # Draw fitted ellipses (more accurate than circles)
+    for region in regions:
+        cy, cx = region.centroid
+
+        # Use major/minor axis for ellipse
+        if region.major_axis_length > 0 and region.minor_axis_length > 0:
+            # Ellipse with orientation
+            ellipse = Ellipse(
+                (cx, cy),
+                width=region.minor_axis_length,
+                height=region.major_axis_length,
+                angle=np.degrees(-region.orientation),
+                fill=False,
+                edgecolor='lime',
+                linewidth=1.5
+            )
+            ax.add_patch(ellipse)
+
+            # Add droplet number label
+            ax.text(cx, cy, str(region.label), fontsize=6, color='yellow',
+                   ha='center', va='center', fontweight='bold')
+
+    ax.set_title(f'Detected Droplets with Ellipse Fits')
     ax.axis('off')
 
     # Add statistics annotation
     stats_text = (
         f"Droplets: {frame_stats['n_droplets']}\n"
         f"Coverage: {frame_stats['coverage_percent']:.2f}%\n"
-        f"Mean area: {frame_stats['mean_area_px']:.1f} px"
+        f"Mean area: {frame_stats['mean_area_px']:.1f} px\n"
+        f"Mean diameter: {frame_stats['mean_area_px']**0.5 * 2 / np.pi**0.5:.1f} px"
     )
-    fig.text(0.02, 0.02, stats_text, fontsize=9, family='monospace',
-             verticalalignment='bottom', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+    fig.text(0.02, 0.02, stats_text, fontsize=10, family='monospace',
+             verticalalignment='bottom', bbox=dict(boxstyle='round', facecolor='white', alpha=0.9))
 
     plt.tight_layout()
     return fig
@@ -1091,8 +1082,9 @@ Examples:
     parser.add_argument(
         '--prob-threshold',
         type=float,
-        default=0.5,
-        help='Probability threshold for detecting droplet edges (default: 0.5).'
+        default=0.8,
+        help='Probability threshold for detecting droplet edges (default: 0.8). '
+             'For halo patterns, 0.75-0.85 often works well.'
     )
     parser.add_argument(
         '--center-threshold',
